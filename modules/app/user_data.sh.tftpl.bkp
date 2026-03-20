@@ -1,0 +1,153 @@
+#!/bin/bash
+set -e
+exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+echo "Iniciando user-data em $(date)"
+
+echo "Atualizando o sistema..."
+dnf update -y
+dnf install vim -y
+dnf install vim httpd-tools -y
+
+# ============================================
+# Instalação do Docker
+# ============================================
+echo "Instalando o Docker CE..."
+dnf remove -y docker docker-client docker-client-latest docker-common docker-latest \
+  docker-latest-logrotate docker-logrotate docker-engine podman runc 2>/dev/null || true
+
+dnf install -y dnf-plugins-core
+dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+
+sleep 5
+systemctl is-active docker || { echo "ERRO: Docker não está ativo"; exit 1; }
+echo "Docker está rodando."
+
+usermod -aG docker rocky
+echo "Instalação do Docker CE concluída."
+
+# ============================================
+# Configuração do Apache Hop Web (Hop Gui)
+# ============================================
+echo "Preparando o Apache Hop Web..."
+
+# Variáveis passadas pelo template (substituídas pelo Terraform)
+HOP_VERSION="${hop_version}"
+HOP_USER="${hop_user}"
+HOP_PASSWORD="${hop_password}"
+
+mkdir -p /opt/hop/config
+mkdir -p /opt/hop/data
+mkdir -p /opt/hop/audit
+
+cat > /opt/hop/config/tomcat-users.xml << EOF
+<?xml version='1.0' encoding='utf-8'?>
+<tomcat-users>
+  <role rolename="apachehop"/>
+  <user username="$${HOP_USER}" password="$${HOP_PASSWORD}" roles="apachehop"/>
+</tomcat-users>
+EOF
+
+chown -R 1000:1000 /opt/hop/config 2>/dev/null || true
+
+echo "Baixando imagem apache/hop-web:$${HOP_VERSION}..."
+docker pull apache/hop-web:$${HOP_VERSION}
+docker image inspect apache/hop-web:$${HOP_VERSION} >/dev/null || { echo "ERRO: Falha ao baixar imagem"; exit 1; }
+
+# ============================================
+# Criação do serviço systemd para o container
+# ============================================
+cat > /etc/systemd/system/hop.service << EOF
+[Unit]
+Description=Apache Hop Web Container
+Requires=docker.service
+After=docker.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=root
+Restart=always
+ExecStartPre=-/usr/bin/docker stop hop-web
+ExecStartPre=-/usr/bin/docker rm hop-web
+ExecStart=/usr/bin/docker run --rm --name hop-web \\
+  -p 127.0.0.1:8080:8080 \\
+  -e HOP_CONFIG_FOLDER=/config \\
+  -e HOP_AUDIT_FOLDER=/audit \\
+  -v /opt/hop/config:/config \\
+  -v /opt/hop/audit:/audit \\
+  -v /opt/hop/data:/files \\
+  -e HOP_WEB_THEME=light \\
+  apache/hop-web:$${HOP_VERSION}
+ExecStop=/usr/bin/docker stop hop-web
+ExecStopPost=/usr/bin/docker rm hop-web
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable hop.service
+systemctl start hop.service
+
+sleep 5
+systemctl is-active hop.service || { echo "ERRO: Serviço hop não está ativo"; exit 1; }
+echo "Serviço hop iniciado (container em 127.0.0.1:8080)."
+
+# ============================================
+# Instalação e configuração do Nginx (proxy reverso)
+# ============================================
+echo "Instalando Nginx..."
+dnf install -y nginx
+
+rm -f /etc/nginx/conf.d/default.conf
+
+# Determina o contexto da aplicação (provável /hop)
+CONTEXT="/hop"
+if ! curl -s -o /dev/null -w "%%{http_code}" http://127.0.0.1:8080$${CONTEXT} | grep -q "200\|302"; then
+  echo "Contexto /hop não respondeu 200, tentando /ui..."
+  CONTEXT="/ui"
+fi
+
+cat > /etc/nginx/conf.d/hop.conf << EOF
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+
+nginx -t
+systemctl enable nginx
+systemctl start nginx
+echo "Nginx configurado como proxy reverso na porta 80, contexto $${CONTEXT}."
+
+# ============================================
+# Ajuste SELinux
+# ============================================
+echo "Configurando SELinux para permitir proxy reverso..."
+if command -v getenforce && [ "$(getenforce)" != "Disabled" ]; then
+  setsebool -P httpd_can_network_connect on
+  echo "Permissão SELinux httpd_can_network_connect ativada."
+else
+  echo "SELinux está desabilitado ou não encontrado. Pulando configuração."
+fi
+
+# ============================================
+# Mensagem final
+# ============================================
+PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+echo "=================================================="
+echo "Apache Hop Web está rodando!"
+echo "URL: http://$${PUBLIC_IP}$${CONTEXT}/"
+echo "Usuário: $${HOP_USER}"
+echo "Senha: [configurada]"
+echo "=================================================="
